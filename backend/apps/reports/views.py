@@ -13,6 +13,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from apps.core.response import success_response, error_response
 from apps.warehouse.models import Goods, StockIn, StockOut, Warning
+from .anonymization import (
+    AnonymizationError, build_trend_report, describe_policy,
+)
 from .models import DailyReport
 
 logger = logging.getLogger('apps')
@@ -324,3 +327,145 @@ class SystemMonitorView(APIView):
                 'process_count': process_count
             }
         })
+
+
+# ==================== 脱敏趋势报表 ====================
+
+def _parse_date(value, name):
+    try:
+        return datetime.strptime(value, '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        raise AnonymizationError(f'{name} 格式应为 YYYY-MM-DD')
+
+
+def _log_anonymized_export(request, report):
+    """记录脱敏报表导出操作，含策略版本与数据范围，供审计追溯。"""
+    from apps.authentication.models import OperationLog
+    summary = report['summary']
+    try:
+        OperationLog.objects.create(
+            user=request.user,
+            action='export',
+            module='脱敏报表',
+            detail=(
+                f"用途={summary['purpose']} 策略版本={summary['strategy_version']} "
+                f"窗口={summary['aligned_window']['start']}~{summary['aligned_window']['end']} "
+                f"快照={summary['snapshot_ids']}"
+            ),
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.headers.get('User-Agent', '')[:500]
+        )
+    except Exception as e:
+        logger.error(f"Failed to log anonymized export: {e}")
+
+
+class AnonymizedTrendReportView(APIView):
+    """
+    按用途脱敏的收发趋势报表。
+
+    GET 参数：
+    - purpose: 报表用途（external_inspection / internal_audit）
+    - granularity: 统计粒度（week / month）
+    - start_date / end_date: 请求窗口，向外对齐到整周期，进行中周期不输出
+    - export: xlsx 时导出文件（附导出摘要供审核人确认），默认返回 JSON
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        params = request.query_params
+        purpose = params.get('purpose', 'external_inspection')
+        granularity = params.get('granularity', 'week')
+
+        try:
+            end_date = _parse_date(params.get('end_date'), 'end_date') \
+                if params.get('end_date') else datetime.now().date()
+            start_date = _parse_date(params.get('start_date'), 'start_date') \
+                if params.get('start_date') else end_date - timedelta(days=28)
+            report = build_trend_report(
+                request.user, purpose, granularity, start_date, end_date
+            )
+        except AnonymizationError as e:
+            return error_response(message=e.message, code=e.code)
+
+        _log_anonymized_export(request, report)
+
+        if params.get('export') == 'xlsx':
+            return self._render_xlsx(report)
+        return success_response(data=report)
+
+    def _render_xlsx(self, report):
+        """导出 xlsx：第一个工作表为导出摘要，第二个为脱敏数据。"""
+        summary = report['summary']
+        wb = Workbook()
+
+        header_font = Font(bold=True, color='FFFFFF')
+        header_fill = PatternFill(start_color='0066FF', end_color='0066FF', fill_type='solid')
+
+        # 摘要工作表：数据范围与处理规则，供审核人确认
+        ws_summary = wb.active
+        ws_summary.title = '导出摘要'
+        ws_summary.append(['项目', '内容'])
+        for col in range(1, 3):
+            cell = ws_summary.cell(row=1, column=col)
+            cell.font = header_font
+            cell.fill = header_fill
+        strategy = summary['strategy']
+        summary_rows = [
+            ('报表用途', f"{summary['purpose_label']}（{summary['purpose']}）"),
+            ('脱敏策略版本', summary['strategy_version']),
+            ('请求窗口', f"{summary['requested_window']['start']} ~ {summary['requested_window']['end']}"),
+            ('对齐后数据范围', f"{summary['aligned_window']['start']} ~ {summary['aligned_window']['end']}"),
+            ('统计粒度', strategy['granularity']),
+            ('进行中周期已排除', '是' if summary['current_period_excluded'] else '否'),
+            ('小样本阈值(组合并/抑制)', strategy['min_group_size']),
+            ('小样本处理方式', strategy['suppression_mode']),
+            ('总量取整步长', strategy['rounding_step']),
+            ('数据口径', summary['record_scope']),
+            ('输出字段', '、'.join(summary['fields'])),
+            ('已裁剪敏感字段', '、'.join(summary['excluded_sensitive_fields'])),
+            ('合并组数 / 抑制组数', f"{summary['totals']['merged_groups']} / {summary['totals']['suppressed_groups']}"),
+            ('快照编号', ', '.join(str(i) for i in summary['snapshot_ids'])),
+            ('生成时间', summary['generated_at']),
+        ]
+        for row in summary_rows:
+            ws_summary.append(list(row))
+        ws_summary.column_dimensions['A'].width = 24
+        ws_summary.column_dimensions['B'].width = 80
+
+        # 数据工作表
+        ws_data = wb.create_sheet('趋势数据')
+        headers = ['周期'] + [
+            {'category': '品类', 'variety': '品种'}[d]
+            for d in summary['dimensions'] if d != 'period'
+        ] + ['入库次数', '入库总量', '出库次数', '出库总量']
+        ws_data.append(headers)
+        for col in range(1, len(headers) + 1):
+            cell = ws_data.cell(row=1, column=col)
+            cell.font = header_font
+            cell.fill = header_fill
+        dim_keys = [d for d in summary['dimensions'] if d != 'period']
+        for row in report['rows']:
+            ws_data.append(
+                [row['period']]
+                + [row.get(d, '') for d in dim_keys]
+                + [row['in_count'], row['in_total'], row['out_count'], row['out_total']]
+            )
+        for column in ws_data.columns:
+            ws_data.column_dimensions[column[0].column_letter].width = 18
+
+        filename = f"脱敏趋势报表_{summary['purpose']}_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+        response = HttpResponse(
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        wb.save(response)
+        logger.info(f"Anonymized report exported: {summary['purpose']} {summary['strategy_version']}")
+        return response
+
+
+class AnonymizationPolicyView(APIView):
+    """返回当前脱敏策略与用途授权清单，供审核人确认处理规则。"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return success_response(data=describe_policy(request.user))
